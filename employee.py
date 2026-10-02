@@ -22,7 +22,7 @@ class Employee(ABC):
         self.base_salary = base_salary
         self.hours_worked = hours_worked
         self.hourly_rate = hourly_rate
-        self._leave_balance = 20
+        self._leave_balance = 30  # Default leave balance
         self.payroll_strategy = payroll_strategy if payroll_strategy is not None else SalariedStrategy()  # Default strategy
 
     
