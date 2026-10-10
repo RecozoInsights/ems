@@ -1,14 +1,18 @@
+import sqlite3
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from employee import EmployeeFactory, LeaveRequest
+from employee import EmployeeFactory, LeaveRequest, EmailNotifier, AuditLogger
 from department import Department
-
+from leave_repository import LeaveRequestRepository, approve_leave_request, reject_leave_request
 
 app = FastAPI()
 
-department = Department("Engineering")
-leave_requests = {}
+conn = sqlite3.connect("ems.db", check_same_thread=False)
+department = Department("Engineering", conn=conn)
+leave_repo = LeaveRequestRepository(conn)
+audit_logger = AuditLogger()
+email_notifier = EmailNotifier()
 
 
 # ---------- Request Models ----------
@@ -45,8 +49,6 @@ class LeaveRequestResponse(BaseModel):
     state: str
 
 
-# ---------- Converters ----------
-
 def to_employee_response(employee) -> EmployeeResponse:
     return EmployeeResponse(
         employee_id=employee.employee_id,
@@ -58,9 +60,16 @@ def to_employee_response(employee) -> EmployeeResponse:
     )
 
 
-def to_leave_request_response(
-    leave_request
-) -> LeaveRequestResponse:
+def load_leave_request(request_id):
+    lr = leave_repo.get(request_id, department)
+    if lr is None:
+        return None
+    lr.attach(email_notifier)
+    lr.attach(audit_logger)
+    return lr
+
+
+def to_leave_request_response(leave_request) -> LeaveRequestResponse:
     return LeaveRequestResponse(
         request_id=leave_request.request_id,
         employee_id=leave_request.employee.employee_id,
@@ -76,70 +85,46 @@ def to_leave_request_response(
 def create_employee(req: CreateEmployeeRequest):
     try:
         employee = EmployeeFactory.create_employee(
-            req.employee_type,
-            req.name,
-            req.base_salary,
-            hours_worked=req.hours_worked,
-            hourly_rate=req.hourly_rate,
+            req.employee_type, req.name, req.base_salary,
+            hours_worked=req.hours_worked, hourly_rate=req.hourly_rate,
         )
-
         department.add_employee(employee)
-
+        conn.commit()  # write committed here -- Department itself no longer commits
         return to_employee_response(employee)
-
     except (ValueError, TypeError) as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/employees", response_model=list[EmployeeResponse])
 def list_employees():
-    return [
-        to_employee_response(employee)
-        for employee in department.list_employees()
-    ]
+    return [to_employee_response(e) for e in department.list_employees()]
 
 
-@app.get(
-    "/employees/{employee_id}",
-    response_model=EmployeeResponse
-)
+@app.get("/employees/{employee_id}", response_model=EmployeeResponse)
 def get_employee(employee_id: int):
     employee = department.get_employee(employee_id)
-
     if employee is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Employee not found"
-        )
-
+        raise HTTPException(status_code=404, detail="Employee not found")
     return to_employee_response(employee)
 
 
 @app.delete("/employees/{employee_id}")
 def delete_employee(employee_id: int):
-    employee = department.get_employee(employee_id)
-
-    if employee is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Employee not found"
-        )
-
-    department.remove_employee(employee_id)
-
-    return {"message": "Employee removed"}
+    try:
+        department.remove_employee(employee_id)
+        conn.commit()
+        return {"message": "Employee removed"}
+    except ValueError as e:
+        conn.rollback()
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # ---------- Department Routes ----------
 
 @app.get("/department/payroll")
 def get_payroll():
-    return {
-        "total_payroll": department.total_payroll()
-    }
+    return {"total_payroll": department.total_payroll()}
 
 
 @app.get("/department/headcount")
@@ -149,75 +134,47 @@ def get_headcount():
 
 # ---------- Leave Request Routes ----------
 
-@app.post(
-    "/leave-requests",
-    response_model=LeaveRequestResponse
-)
+@app.post("/leave-requests", response_model=LeaveRequestResponse)
 def create_leave_request(req: CreateLeaveRequest):
     employee = department.get_employee(req.employee_id)
-
     if employee is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Employee not found"
-        )
-
+        raise HTTPException(status_code=404, detail="Employee not found")
     try:
         leave_request = LeaveRequest(employee, req.days)
-        leave_requests[leave_request.request_id] = leave_request
-
+        leave_request.attach(email_notifier)
+        leave_request.attach(audit_logger)
+        leave_repo.save(leave_request)
+        conn.commit()
         return to_leave_request_response(leave_request)
-
     except (ValueError, TypeError) as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post(
-    "/leave-requests/{request_id}/approve",
-    response_model=LeaveRequestResponse
-)
-def approve_leave_request(request_id: int):
-    leave_request = leave_requests.get(request_id)
+@app.get("/leave-requests", response_model=list[LeaveRequestResponse])
+def list_leave_requests():
+    return [to_leave_request_response(lr) for lr in leave_repo.list_all(department)]
 
+
+@app.post("/leave-requests/{request_id}/approve", response_model=LeaveRequestResponse)
+def approve_leave_request_route(request_id: int):
+    leave_request = load_leave_request(request_id)
     if leave_request is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Leave request not found"
-        )
-
+        raise HTTPException(status_code=404, detail="Leave request not found")
     try:
-        leave_request.approve()
+        approve_leave_request(leave_request, leave_repo, department)
         return to_leave_request_response(leave_request)
-
     except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post(
-    "/leave-requests/{request_id}/reject",
-    response_model=LeaveRequestResponse
-)
-def reject_leave_request(request_id: int):
-    leave_request = leave_requests.get(request_id)
-
+@app.post("/leave-requests/{request_id}/reject", response_model=LeaveRequestResponse)
+def reject_leave_request_route(request_id: int):
+    leave_request = load_leave_request(request_id)
     if leave_request is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Leave request not found"
-        )
-
+        raise HTTPException(status_code=404, detail="Leave request not found")
     try:
-        leave_request.reject()
+        reject_leave_request(leave_request, leave_repo, department)
         return to_leave_request_response(leave_request)
-
     except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=400, detail=str(e))
